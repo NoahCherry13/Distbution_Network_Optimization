@@ -2,6 +2,14 @@
 W = 6;
 PV_buses = [5, 12, 24];  % buses with PV inverters
 EVA_buses = [10, 22];    % buses with EV aggregators
+% Initialization
+nClusters = length(clusters);
+boundary_values.P = zeros(nBuses, W);
+boundary_values.Q = zeros(nBuses, W);
+boundary_values.V2 = ones(nBuses, W); % assume 1.0^2 to start
+
+cluster_states = cell(nClusters, 1);
+
 
 lines = [
     1  2  0.0922  0.0470;
@@ -209,78 +217,97 @@ end
 V_base = ones(nBuses, W);
 end
 
-function [Q_ctrl, P_ctrl, V_result] = mpcController(cluster, lines, P_PV_full, S_PV_full, P_EV_base_full, P_load_full, Q_load_full, V_base_full, parent, W)
-% Simplified MPC controller for testing DistFlow feasibility (no control variables)
-% Only applies standard DistFlow constraints (no PV or EV control)
+function [Q_ctrl, P_ctrl, V_result, cluster_state] = mpcController(cluster, lines, P_PV_full, S_PV_full, P_EV_base_full, P_load_full, Q_load_full, V_base_full, parent, W, boundary_values)
+% MPC controller with inter-cluster coordination using passed boundary values
+% Inputs:
+% - cluster: struct with .nodes, .PVs, .EVAs
+% - lines: [from, to, R, X] line matrix
+% - parent: parent vector indexed by global bus numbers
+% - boundary_values: struct with fields 'P', 'Q', 'V2' indexed by global bus numbers
 
 nodes = cluster.members;
+nodes_map = containers.Map(nodes, 1:length(nodes));
 nBuses = length(nodes);
+
 % Extract per-cluster data
 P_load = P_load_full(nodes, 1:W);
 Q_load = Q_load_full(nodes, 1:W);
 
-% Create line resistance and reactance arrays aligned with parent indices
+% Line resistance and reactance for each bus relative to parent
 R = zeros(nBuses, 1);
 X = zeros(nBuses, 1);
 for i = 2:nBuses
-    k = parent(i);
-    if k == 0
-        continue;
-    end
-    from = nodes(k);
-    to = nodes(i);
-    idx = find((lines(:,1) == from & lines(:,2) == to) | (lines(:,1) == to & lines(:,2) == from), 1);
+    k = parent(nodes(i));
+    idx = find((lines(:,1) == nodes(i) & lines(:,2) == k) | (lines(:,1) == k & lines(:,2) == nodes(i)), 1);
     if ~isempty(idx)
-        R(i) = lines(idx,3);
-        X(i) = lines(idx,4);
+        R(i) = lines(idx,3)/100;
+        X(i) = lines(idx,4)/100;
     end
 end
-R = R/100;
-X = X/100;
+
 % Create YALMIP variables
 V2 = sdpvar(nBuses, W);
 P = sdpvar(nBuses, W);
 Q = sdpvar(nBuses, W);
 
-Vmin = 0.90;
-Vmax = 1.1;
+Vmin = 0.95;
+Vmax = 1.05;
 
 constraints = [];
 
-% Fix voltage at root bus
+% Fix voltage at root node if it exists
 for t = 1:W
-    constraints = [constraints, V2(1,t) == 1.0^2];
+    if nodes(1) == 1  % slack bus present in cluster
+        constraints = [constraints, V2(1,t) == 1.0^2];
+    end
+    constraints = [constraints, Vmin^2 <= V2(:,t) <= Vmax^2];
 end
 
 for t = 1:W
-    constraints = [constraints, Vmin^2 <= V2(:,t) <= Vmax^2];
-
     for i = 1:nBuses
-        k = parent(cluster.members(i));
-        if k == 0
-            disp(["here", i])
+        global_idx = nodes(i);
+        k_global = parent(global_idx);
+
+        if k_global == 0
             continue;
         end
 
-        constraints = [constraints,
-            P(i,t) == P(k,t) - P_load(i,t) - R(i)*(P(k,t)^2 + Q(k,t)^2),
-            Q(i,t) == Q(k,t) - Q_load(i,t) - X(i)*(P(k,t)^2 + Q(k,t)^2),
-            V2(i,t) == V2(k,t) - 2*(R(i)*P(k,t) + X(i)*Q(k,t))];
+        if isKey(nodes_map, k_global)
+            k = nodes_map(k_global);
+            constraints = [constraints,
+                P(i,t) == P(k,t) - P_load(i,t) - R(i)*(P(k,t)^2 + Q(k,t)^2),
+                Q(i,t) == Q(k,t) - Q_load(i,t) - X(i)*(P(k,t)^2 + Q(k,t)^2),
+                V2(i,t) == V2(k,t) - 2*(R(i)*P(k,t) + X(i)*Q(k,t))];
+        else
+            % Use passed boundary values
+            P_k = boundary_values.P(k_global,t);
+            Q_k = boundary_values.Q(k_global,t);
+            V2_k = boundary_values.V2(k_global,t);
+
+            constraints = [constraints,
+                P(i,t) == P_k - P_load(i,t) - R(i)*(P_k^2 + Q_k^2),
+                Q(i,t) == Q_k - Q_load(i,t) - X(i)*(P_k^2 + Q_k^2),
+                V2(i,t) == V2_k - 2*(R(i)*P_k + X(i)*Q_k)];
+        end
     end
 end
 
-% Dummy objective
 objective = sum(sum(P)) + sum(sum(Q));
 
 ops = sdpsettings('solver', 'gurobi', 'verbose', 0);
-diagnostics = optimize(constraints, [], ops);
+diagnostics = optimize(constraints, objective, ops);
 
 Q_ctrl = [];
 P_ctrl = [];
 if diagnostics.problem == 0
     V_result = value(V2);
+    cluster_state.P = value(P);
+    cluster_state.Q = value(Q);
+    cluster_state.V2 = value(V2);
+    cluster_state.nodes = nodes;
 else
     warning('DistFlow feasibility problem.');
     V_result = NaN(nBuses, W);
+    cluster_state = struct('P', [], 'Q', [], 'V2', [], 'nodes', nodes);
 end
 end
